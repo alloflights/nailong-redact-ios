@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-ipa:
     name: Build NailongRedact.ipa
@@ -16,13 +19,11 @@ jobs:
 
       - name: Select newest Xcode
         run: |
-          ls -la /Applications | grep -i xcode || true
           XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
           if [ -n "$XCODE_APP" ]; then
             sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           fi
           xcodebuild -version
-          xcodebuild -showsdks
 
       - name: Install XcodeGen and generate project
         run: |
@@ -56,3 +57,17 @@ jobs:
         with:
           name: NailongRedact-ipa
           path: NailongRedact.ipa
+
+      - name: Publish NailongRedact.ipa to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest NailongRedact.ipa --clobber
+            gh release edit latest --title "NailongRedact" --notes ""
+          else
+            gh release create latest NailongRedact.ipa \
+              --title "NailongRedact" \
+              --notes "" \
+              --latest
+          fi
