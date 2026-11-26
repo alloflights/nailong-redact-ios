@@ -1,0 +1,8 @@
+.DS_Store
+ChatRedactPreviewBin
+verify_out/
+build/
+*.xcodeproj/
+*.xcworkspace/
+*.ipa
+Info.plist

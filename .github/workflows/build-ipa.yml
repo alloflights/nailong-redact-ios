@@ -1,0 +1,58 @@
+name: Build iOS Unsigned IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    name: Build NailongRedact.ipa
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          ls -la /Applications | grep -i xcode || true
+          XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$XCODE_APP" ]; then
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Install XcodeGen and generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Archive unsigned iOS app
+        run: |
+          mkdir -p build
+          xcodebuild archive \
+            -project NailongRedact.xcodeproj \
+            -scheme NailongRedact \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath "build/NailongRedact.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual
+
+      - name: Package Payload into NailongRedact.ipa
+        run: |
+          mkdir -p Payload
+          cp -R "build/NailongRedact.xcarchive/Products/Applications/NailongRedact.app" Payload/
+          zip -qry NailongRedact.ipa Payload
+          rm -rf Payload
+          ls -lh NailongRedact.ipa
+
+      - name: Upload NailongRedact.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NailongRedact-ipa
+          path: NailongRedact.ipa
