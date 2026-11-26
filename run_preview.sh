@@ -7,6 +7,7 @@ swiftc -O \
   -framework SwiftUI \
   -framework AppKit \
   -framework PhotosUI \
+  -framework Photos \
   -framework AppIntents \
   -framework Vision \
   -framework CoreGraphics \

@@ -11,15 +11,23 @@ import AppKit
 import UIKit
 #endif
 
+public struct OCRCharBox: Identifiable, Sendable {
+    public let id = UUID()
+    public let char: String
+    public let rectTopLeft: CGRect
+}
+
 public struct OCRItem: Identifiable, Sendable {
     public let id = UUID()
     public let text: String
     public let rectTopLeft: CGRect
+    public let charBoxes: [OCRCharBox]
 }
 
 public struct DetectedAvatar {
     public let rectTopLeft: CGRect
     public let isRightSide: Bool
+    public let isCircular: Bool
     public let fingerprint: [Double]
     public var matchedNameItem: OCRItem?
     public var badgeItems: [OCRItem] = []
@@ -50,17 +58,36 @@ public enum ChatRedactionEngine {
                 width: box.width * w,
                 height: box.height * h
             )
-            return OCRItem(text: candidate.string, rectTopLeft: topLeft)
+
+            // 提取逐字精确包围盒，用于“指哪里打哪里”的局部吸合
+            let str = candidate.string
+            var chars: [OCRCharBox] = []
+            var idx = str.startIndex
+            while idx < str.endIndex {
+                let next = str.index(after: idx)
+                if let subObs = try? candidate.boundingBox(for: idx..<next) {
+                    let sb = subObs.boundingBox
+                    let charRect = CGRect(
+                        x: sb.minX * w,
+                        y: (1.0 - sb.maxY) * h,
+                        width: max(4, sb.width * w),
+                        height: max(8, sb.height * h)
+                    )
+                    chars.append(OCRCharBox(char: String(str[idx]), rectTopLeft: charRect))
+                }
+                idx = next
+            }
+
+            return OCRItem(text: str, rectTopLeft: topLeft, charBoxes: chars)
         }
     }
 
-    /// 永久扁平化导出为无 EXIF/定位元数据的 PNG Data（参考 Black Highlighter 安全抹除机制）
+    /// 永久扁平化导出为无 EXIF/定位元数据的 PNG Data
     public static func exportFlattenedPNGData(from cgImage: CGImage) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data as CFMutableData, UTType.png.identifier as CFString, 1, nil) else {
             return nil
         }
-        // 传入空属性字典，剥离 EXIF / GPS / 拍摄设备信息
         CGImageDestinationAddImage(dest, cgImage, nil)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return data as Data
@@ -70,7 +97,7 @@ public enum ChatRedactionEngine {
         source: CGImage,
         participants: [ParticipantIdentity],
         options: RedactionOptions,
-        manualBoxes: [ManualRedactionBox] = [],
+        manualMosaics: [ManualMosaicBox] = [],
         precomputedOCR: [OCRItem]? = nil
     ) -> (image: CGImage, summary: RedactionSummary)? {
         guard !participants.isEmpty else { return nil }
@@ -112,12 +139,7 @@ public enum ChatRedactionEngine {
             detectedPlatform = resolvePlatform(
                 requested: options.platform,
                 ocrItems: ocrItems,
-                avatars: avatars,
-                pixels: pixels,
-                width: W,
-                height: H,
-                bytesPerRow: bytesPerRow,
-                chatBg: chatBg
+                avatars: avatars
             )
 
             var consumedOCRIndices = Set<Int>()
@@ -159,7 +181,7 @@ public enum ChatRedactionEngine {
                 }
             }
 
-            let activeCap = max(1, min(10, options.maxParticipants, participants.count))
+            let activeCap = min(10, participants.count)
             var keyToSlot: [String: Int] = [:]
             var fingerprintSlots: [(fingerprint: [Double], slot: Int)] = []
             var nextSlot = 0
@@ -199,18 +221,20 @@ public enum ChatRedactionEngine {
                 }
             }
 
+            let chatBgCG = CGColor(srgbRed: chatBg.0 / 255.0, green: chatBg.1 / 255.0, blue: chatBg.2 / 255.0, alpha: 1.0)
             for av in avatars {
                 let identity = participants[av.participantSlot]
-                let isCircle = (detectedPlatform == .qq)
+                // 先用当前头像所在背景底色清空原头像边界，再按该头像实际形状（方/圆）绘制对应奶龙头像
+                let avBg = sampleSurroundingColor(pixels: pixels, width: W, height: H, bytesPerRow: bytesPerRow, rectTopLeft: av.rectTopLeft)
+                fillTopLeftRect(ctx, rectTopLeft: av.rectTopLeft.insetBy(dx: -1.5, dy: -1.5), imageHeight: hF, color: avBg)
                 drawReplacedAvatar(
                     ctx: ctx,
                     avatarImage: identity.avatarCGImage,
                     rectTopLeft: av.rectTopLeft,
                     imageHeight: hF,
-                    isCircle: isCircle
+                    isCircle: av.isCircular
                 )
 
-                let chatBgCG = CGColor(srgbRed: chatBg.0 / 255.0, green: chatBg.1 / 255.0, blue: chatBg.2 / 255.0, alpha: 1.0)
                 for badge in av.badgeItems {
                     let padRect = badge.rectTopLeft.insetBy(dx: -8, dy: -5)
                     fillTopLeftRect(ctx, rectTopLeft: padRect, imageHeight: hF, color: chatBgCG)
@@ -323,9 +347,16 @@ public enum ChatRedactionEngine {
 
                 let sensitiveMatches = mergeRanges(findSensitiveRanges(in: text, options: options), in: text)
                 for matchRange in sensitiveMatches {
-                    let subRect = proportionalSubRect(of: r, fullText: text, matchRange: matchRange)
-                    let pillRect = subRect.insetBy(dx: -7, dy: -3)
-                    fillRoundedTopLeftRect(ctx, rectTopLeft: pillRect, imageHeight: hF, radius: 5, color: options.privacyBarColor.cgColor)
+                    let subRect = exactSubRect(of: item, matchRange: matchRange)
+                    let mosaicRect = subRect.insetBy(dx: -4, dy: -2)
+                    drawMosaic(
+                        ctx: ctx,
+                        sourcePixels: pixels,
+                        width: W,
+                        height: H,
+                        bytesPerRow: bytesPerRow,
+                        rectTopLeft: mosaicRect
+                    )
                     privacyHitCount += 1
                 }
             }
@@ -336,15 +367,22 @@ public enum ChatRedactionEngine {
             assignedNames = usedSlots.map { participants[$0].displayName }
         }
 
-        // 绘制 Black Highlighter 手动划选/框选的实心涂抹条
-        for box in manualBoxes {
+        // 手动划选 / 框选：直接渲染为永久像素马赛克
+        for box in manualMosaics {
             let rectTopLeft = CGRect(
                 x: box.normalizedRect.minX * wF,
                 y: box.normalizedRect.minY * hF,
                 width: box.normalizedRect.width * wF,
                 height: box.normalizedRect.height * hF
             )
-            fillRoundedTopLeftRect(ctx, rectTopLeft: rectTopLeft, imageHeight: hF, radius: 5, color: box.color.cgColor)
+            drawMosaic(
+                ctx: ctx,
+                sourcePixels: pixels,
+                width: W,
+                height: H,
+                bytesPerRow: bytesPerRow,
+                rectTopLeft: rectTopLeft
+            )
         }
 
         guard let outImage = ctx.makeImage() else { return nil }
@@ -355,13 +393,70 @@ public enum ChatRedactionEngine {
             uniqueParticipantCount: uniqueCount,
             nameReplacementCount: nameReplacementCount,
             privacyHitCount: privacyHitCount,
-            manualBoxCount: manualBoxes.count,
+            mosaicCount: manualMosaics.count,
             assignedNames: assignedNames
         )
         return (outImage, summary)
     }
 
-    // MARK: - 头像几何检测
+    // MARK: - 像素马赛克渲染
+
+    private static func drawMosaic(
+        ctx: CGContext,
+        sourcePixels: [UInt8],
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        rectTopLeft: CGRect
+    ) {
+        let clamped = rectTopLeft.intersection(CGRect(x: 0, y: 0, width: width, height: height))
+        guard clamped.width >= 2, clamped.height >= 2 else { return }
+
+        let blockSize = max(10, min(24, Int(CGFloat(width) * 0.017)))
+        let startX = Int(floor(clamped.minX))
+        let endX = Int(ceil(clamped.maxX))
+        let startY = Int(floor(clamped.minY))
+        let endY = Int(ceil(clamped.maxY))
+
+        let cgClip = toCG(clamped, imageHeight: CGFloat(height))
+        let clipPath = CGPath(roundedRect: cgClip, cornerWidth: 4, cornerHeight: 4, transform: nil)
+        ctx.saveGState()
+        ctx.addPath(clipPath)
+        ctx.clip()
+
+        var by = startY
+        while by < endY {
+            let blockEndY = min(endY, by + blockSize)
+            var bx = startX
+            while bx < endX {
+                let blockEndX = min(endX, bx + blockSize)
+                var sumR = 0, sumG = 0, sumB = 0, count = 0
+                for py in by..<blockEndY {
+                    for px in bx..<blockEndX {
+                        let off = py * bytesPerRow + px * 4
+                        sumR += Int(sourcePixels[off])
+                        sumG += Int(sourcePixels[off + 1])
+                        sumB += Int(sourcePixels[off + 2])
+                        count += 1
+                    }
+                }
+                if count > 0 {
+                    let r = CGFloat(sumR) / CGFloat(count * 255)
+                    let g = CGFloat(sumG) / CGFloat(count * 255)
+                    let b = CGFloat(sumB) / CGFloat(count * 255)
+                    ctx.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1.0))
+                    let cellTopLeft = CGRect(x: bx, y: by, width: blockEndX - bx, height: blockEndY - by)
+                    ctx.fill(toCG(cellTopLeft, imageHeight: CGFloat(height)))
+                }
+                bx += blockSize
+            }
+            by += blockSize
+        }
+
+        ctx.restoreGState()
+    }
+
+    // MARK: - 头像几何与方/圆形态独立判定
 
     private static func sampleChatBackground(pixels: [UInt8], width: Int, height: Int, bytesPerRow: Int) -> (Double, Double, Double) {
         let x = max(2, Int(Double(width) * 0.012))
@@ -485,13 +580,41 @@ public enum ChatRedactionEngine {
                 if ratio < 0.72 || ratio > 1.38 { continue }
 
                 let rect = CGRect(x: boxMinX, y: y0, width: w, height: h)
+                let circular = isAvatarCircular(pixels: pixels, width: width, height: height, bytesPerRow: bytesPerRow, rect: rect, chatBg: chatBg)
                 let fp = computeAvatarFingerprint(pixels: pixels, width: width, height: height, bytesPerRow: bytesPerRow, rect: rect)
-                found.append(DetectedAvatar(rectTopLeft: rect, isRightSide: isRight, fingerprint: fp))
+                found.append(DetectedAvatar(rectTopLeft: rect, isRightSide: isRight, isCircular: circular, fingerprint: fp))
             }
         }
 
         found.sort { $0.rectTopLeft.minY < $1.rectTopLeft.minY }
         return found
+    }
+
+    /// 逐头像检测四个角是否为聊天背景色：圆形头像四个角接近背景色，方形/圆角矩形头像四个角接近头像前景色
+    private static func isAvatarCircular(
+        pixels: [UInt8],
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        rect: CGRect,
+        chatBg: (Double, Double, Double)
+    ) -> Bool {
+        let inset = max(2, Int(min(rect.width, rect.height) * 0.06))
+        let corners = [
+            (Int(rect.minX) + inset, Int(rect.minY) + inset),
+            (Int(rect.maxX) - inset, Int(rect.minY) + inset),
+            (Int(rect.minX) + inset, Int(rect.maxY) - inset),
+            (Int(rect.maxX) - inset, Int(rect.maxY) - inset)
+        ]
+        var bgHits = 0
+        for (px, py) in corners where px >= 0 && px < width && py >= 0 && py < height {
+            let off = py * bytesPerRow + px * 4
+            let dist = abs(Double(pixels[off]) - chatBg.0)
+                     + abs(Double(pixels[off + 1]) - chatBg.1)
+                     + abs(Double(pixels[off + 2]) - chatBg.2)
+            if dist < 32 { bgHits += 1 }
+        }
+        return bgHits >= 3
     }
 
     private static func computeAvatarFingerprint(
@@ -529,38 +652,15 @@ public enum ChatRedactionEngine {
     private static func resolvePlatform(
         requested: ChatPlatform,
         ocrItems: [OCRItem],
-        avatars: [DetectedAvatar],
-        pixels: [UInt8],
-        width: Int,
-        height: Int,
-        bytesPerRow: Int,
-        chatBg: (Double, Double, Double)
+        avatars: [DetectedAvatar]
     ) -> ChatPlatform {
         if requested != .auto { return requested }
 
         for item in ocrItems where isQQBadge(item.text) {
             return .qq
         }
-        var cornerBgHits = 0
-        var cornerTotal = 0
-        for av in avatars.prefix(4) {
-            let r = av.rectTopLeft
-            let pts = [
-                (Int(r.minX) + 2, Int(r.minY) + 2),
-                (Int(r.maxX) - 2, Int(r.minY) + 2),
-                (Int(r.minX) + 2, Int(r.maxY) - 2),
-                (Int(r.maxX) - 2, Int(r.maxY) - 2)
-            ]
-            for (px, py) in pts where px >= 0 && px < width && py >= 0 && py < height {
-                cornerTotal += 1
-                let off = py * bytesPerRow + px * 4
-                let dist = abs(Double(pixels[off]) - chatBg.0)
-                         + abs(Double(pixels[off + 1]) - chatBg.1)
-                         + abs(Double(pixels[off + 2]) - chatBg.2)
-                if dist < 24 { cornerBgHits += 1 }
-            }
-        }
-        if cornerTotal > 0 && Double(cornerBgHits) / Double(cornerTotal) >= 0.6 {
+        let circularCount = avatars.filter(\.isCircular).count
+        if !avatars.isEmpty && Double(circularCount) / Double(avatars.count) >= 0.5 {
             return .qq
         }
         return .wechat
@@ -684,17 +784,30 @@ public enum ChatRedactionEngine {
         return merged
     }
 
-    private static func proportionalSubRect(of fullRect: CGRect, fullText: String, matchRange: Range<String.Index>) -> CGRect {
-        let totalUnits = max(1.0, visualWidthUnits(fullText))
-        let prefix = String(fullText[..<matchRange.lowerBound])
-        let matched = String(fullText[matchRange])
+    private static func exactSubRect(of item: OCRItem, matchRange: Range<String.Index>) -> CGRect {
+        let startOffset = item.text.distance(from: item.text.startIndex, to: matchRange.lowerBound)
+        let endOffset = item.text.distance(from: item.text.startIndex, to: matchRange.upperBound)
+        if item.charBoxes.count == item.text.count,
+           startOffset >= 0,
+           endOffset <= item.charBoxes.count,
+           startOffset < endOffset {
+            var unionRect = item.charBoxes[startOffset].rectTopLeft
+            for i in (startOffset + 1)..<endOffset {
+                unionRect = unionRect.union(item.charBoxes[i].rectTopLeft)
+            }
+            return unionRect
+        }
+
+        let totalUnits = max(1.0, visualWidthUnits(item.text))
+        let prefix = String(item.text[..<matchRange.lowerBound])
+        let matched = String(item.text[matchRange])
         let startFrac = visualWidthUnits(prefix) / totalUnits
         let widthFrac = visualWidthUnits(matched) / totalUnits
         return CGRect(
-            x: fullRect.minX + fullRect.width * startFrac,
-            y: fullRect.minY,
-            width: max(18, fullRect.width * widthFrac),
-            height: fullRect.height
+            x: item.rectTopLeft.minX + item.rectTopLeft.width * startFrac,
+            y: item.rectTopLeft.minY,
+            width: max(18, item.rectTopLeft.width * widthFrac),
+            height: item.rectTopLeft.height
         )
     }
 
@@ -769,16 +882,6 @@ public enum ChatRedactionEngine {
         ctx.saveGState()
         ctx.setFillColor(color)
         ctx.fill(toCG(rectTopLeft, imageHeight: imageHeight))
-        ctx.restoreGState()
-    }
-
-    private static func fillRoundedTopLeftRect(_ ctx: CGContext, rectTopLeft: CGRect, imageHeight: CGFloat, radius: CGFloat, color: CGColor) {
-        let cgRect = toCG(rectTopLeft, imageHeight: imageHeight)
-        let path = CGPath(roundedRect: cgRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-        ctx.saveGState()
-        ctx.setFillColor(color)
-        ctx.addPath(path)
-        ctx.fillPath()
         ctx.restoreGState()
     }
 

@@ -2,26 +2,27 @@ import AppIntents
 import CoreGraphics
 import Foundation
 import ImageIO
+import Photos
 import UniformTypeIdentifiers
 
 public enum ShortcutPlatformChoice: String, AppEnum {
-    case auto = "自动识别"
+    case auto = "微信 / QQ"
     case wechat = "微信"
     case qq = "QQ"
 
     public static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "聊天软件")
     public static let caseDisplayRepresentations: [ShortcutPlatformChoice: DisplayRepresentation] = [
-        .auto: "自动识别 (微信 / QQ)",
+        .auto: "微信 / QQ",
         .wechat: "微信",
         .qq: "QQ"
     ]
 }
 
-/// iOS 快捷指令动作：一键把最新截图中的头像与昵称换成 10 色奶龙，并打码隐私信息、抹除 EXIF
+/// iOS 快捷指令动作：打码后直接存入手机相册，并返回无 EXIF 图像文件
 public struct NailongRedactIntent: AppIntent {
-    public static let title: LocalizedStringResource = "奶龙自动打码聊天截图"
+    public static let title: LocalizedStringResource = "奶龙打码并存入相册"
     public static let description = IntentDescription(
-        "自动识别微信/QQ 聊天截图中的头像、昵称和敏感信息，替换为多色奶龙变体与匿名昵称，并剥离 EXIF 导出。"
+        "将微信/QQ 聊天截图中的头像、昵称和敏感信息替换为多色奶龙与匿名昵称，剥离 EXIF 后直接保存到系统相册。"
     )
 
     @Parameter(title: "聊天截图")
@@ -29,9 +30,6 @@ public struct NailongRedactIntent: AppIntent {
 
     @Parameter(title: "聊天平台", default: .auto)
     public var platform: ShortcutPlatformChoice
-
-    @Parameter(title: "最多区分人数", default: 10)
-    public var maxParticipants: Int
 
     public init() {}
 
@@ -42,16 +40,17 @@ public struct NailongRedactIntent: AppIntent {
             throw NSError(domain: "NailongRedact", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取截图图像"])
         }
 
-        guard let baseAvatar = loadBundledAvatar(),
-              !AvatarRecolorEngine.generateTenVariants(from: baseAvatar).isEmpty else {
+        guard let baseAvatar = loadBundledAvatar() else {
             throw NSError(domain: "NailongRedact", code: 2, userInfo: [NSLocalizedDescriptionKey: "未找到奶龙基础头像资源"])
         }
 
         let variants = AvatarRecolorEngine.generateTenVariants(from: baseAvatar)
+        guard !variants.isEmpty else {
+            throw NSError(domain: "NailongRedact", code: 2, userInfo: [NSLocalizedDescriptionKey: "生成头像变体失败"])
+        }
         let participants = AliasGenerator.makeParticipants(avatarVariants: variants)
 
         var opts = RedactionOptions()
-        opts.maxParticipants = max(1, min(10, maxParticipants))
         switch platform {
         case .auto: opts.platform = .auto
         case .wechat: opts.platform = .wechat
@@ -61,6 +60,15 @@ public struct NailongRedactIntent: AppIntent {
         guard let result = ChatRedactionEngine.redact(source: inputCG, participants: participants, options: opts),
               let outPNG = ChatRedactionEngine.exportFlattenedPNGData(from: result.image) else {
             throw NSError(domain: "NailongRedact", code: 3, userInfo: [NSLocalizedDescriptionKey: "打码处理失败"])
+        }
+
+        // 直接存入手机相册
+        let authStatus = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        if authStatus == .authorized || authStatus == .limited {
+            try await PHPhotoLibrary.shared().performChanges {
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: outPNG, options: nil)
+            }
         }
 
         let outFile = IntentFile(data: outPNG, filename: "nailong_redacted.png", type: .png)
@@ -88,10 +96,10 @@ public struct NailongShortcutsProvider: AppShortcutsProvider {
             intent: NailongRedactIntent(),
             phrases: [
                 "用\(.applicationName)打码聊天截图",
-                "使用\(.applicationName)给截图换奶龙头像"
+                "使用\(.applicationName)给截图奶龙化并存相册"
             ],
-            shortTitle: "奶龙一键打码",
-            systemImageName: "wand.and.stars"
+            shortTitle: "奶龙打码存相册",
+            systemImageName: "sparkles"
         )
     }
 }

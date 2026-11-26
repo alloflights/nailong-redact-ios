@@ -40,5 +40,5 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         NSPhotoLibraryUsageDescription: 用于读取相册聊天截图并保存打码后的无 EXIF 图片
-        NSPhotoLibraryAddUsageDescription: 用于保存已打码的聊天截图到相册
+        NSPhotoLibraryAddUsageDescription: 用于将打码后的聊天截图直接保存到系统相册
         ITSAppUsesNonExemptEncryption: false

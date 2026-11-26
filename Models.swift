@@ -40,75 +40,28 @@ public extension Image {
 }
 
 public enum ChatPlatform: String, CaseIterable, Identifiable, Sendable {
-    case auto = "自动识别"
+    case auto = "微信 / QQ"
     case wechat = "微信"
     case qq = "QQ"
 
     public var id: String { rawValue }
 }
 
-/// 参考 Black Highlighter 的实心多色涂抹条风格（完全不透明，无法通过调亮图片还原）
-public enum RedactionColorStyle: String, CaseIterable, Identifiable, Sendable {
-    case inkBlack = "墨黑"
-    case pureWhite = "纯白"
-    case nailongBlue = "奶龙蓝"
-    case coralRed = "珊瑚红"
-    case amberYellow = "琥珀黄"
-
-    public var id: String { rawValue }
-
-    public var swiftUIColor: Color {
-        switch self {
-        case .inkBlack:    return Color(red: 0.10, green: 0.11, blue: 0.14)
-        case .pureWhite:   return Color.white
-        case .nailongBlue: return Color(red: 86/255, green: 89/255, blue: 201/255)
-        case .coralRed:    return Color(red: 224/255, green: 74/255, blue: 92/255)
-        case .amberYellow: return Color(red: 236/255, green: 176/255, blue: 40/255)
-        }
-    }
-
-    public var cgColor: CGColor {
-        switch self {
-        case .inkBlack:    return CGColor(srgbRed: 0.10, green: 0.11, blue: 0.14, alpha: 1.0)
-        case .pureWhite:   return CGColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
-        case .nailongBlue: return CGColor(srgbRed: 86/255, green: 89/255, blue: 201/255, alpha: 1.0)
-        case .coralRed:    return CGColor(srgbRed: 224/255, green: 74/255, blue: 92/255, alpha: 1.0)
-        case .amberYellow: return CGColor(srgbRed: 236/255, green: 176/255, blue: 40/255, alpha: 1.0)
-        }
-    }
-}
-
 public enum EditorToolMode: String, CaseIterable, Identifiable, Sendable {
-    case magicHighlighter = "魔法划选"
-    case freeBox = "自由框选"
+    case swipeMosaic = "划选"
+    case freeBoxMosaic = "框选"
 
     public var id: String { rawValue }
-
-    public var systemImage: String {
-        switch self {
-        case .magicHighlighter: return "highlighter"
-        case .freeBox: return "rectangle.dashed"
-        }
-    }
 }
 
-/// 归一化坐标 [0, 1]（左上角原点）的手动打码框
-public struct ManualRedactionBox: Identifiable, Hashable, Sendable {
+/// 归一化坐标 [0, 1]（左上角原点）的马赛克区域
+public struct ManualMosaicBox: Identifiable, Hashable, Sendable {
     public let id: UUID
     public let normalizedRect: CGRect
-    public let color: RedactionColorStyle
-    public let matchedOCRText: String?
 
-    public init(
-        id: UUID = UUID(),
-        normalizedRect: CGRect,
-        color: RedactionColorStyle,
-        matchedOCRText: String? = nil
-    ) {
+    public init(id: UUID = UUID(), normalizedRect: CGRect) {
         self.id = id
         self.normalizedRect = normalizedRect
-        self.color = color
-        self.matchedOCRText = matchedOCRText
     }
 }
 
@@ -154,12 +107,14 @@ public struct AvatarColorVariant: Identifiable, Hashable, Sendable {
 public struct ParticipantIdentity: Identifiable, Sendable {
     public let id: Int
     public let color: AvatarColorVariant
-    public let emotion: String
-    public let numberSuffix: String
+    public var displayName: String
     public let avatarCGImage: CGImage
 
-    public var displayName: String {
-        "\(emotion)的\(color.colorName)奶龙 \(numberSuffix)"
+    public init(id: Int, color: AvatarColorVariant, displayName: String, avatarCGImage: CGImage) {
+        self.id = id
+        self.color = color
+        self.displayName = displayName
+        self.avatarCGImage = avatarCGImage
     }
 }
 
@@ -186,11 +141,11 @@ public enum AliasGenerator {
             } while usedNumbers.contains(numStr)
             usedNumbers.insert(numStr)
 
+            let name = "\(emotion)的\(colors[index].colorName)奶龙 \(numStr)"
             return ParticipantIdentity(
                 id: index,
                 color: colors[index],
-                emotion: emotion,
-                numberSuffix: numStr,
+                displayName: name,
                 avatarCGImage: avatarVariants[index]
             )
         }
@@ -215,13 +170,11 @@ public struct SeededRandomGenerator: RandomNumberGenerator {
 public struct RedactionOptions: Sendable {
     public var platform: ChatPlatform = .auto
     public var autoNailongChat: Bool = true
-    public var maxParticipants: Int = 10
     public var redactPhones: Bool = true
     public var redactIDsAndCards: Bool = true
     public var redactAccountsAndEmails: Bool = true
     public var redactMentions: Bool = true
     public var maskTopTitle: Bool = true
-    public var privacyBarColor: RedactionColorStyle = .inkBlack
 
     public init() {}
 }
@@ -232,6 +185,6 @@ public struct RedactionSummary: Sendable {
     public let uniqueParticipantCount: Int
     public let nameReplacementCount: Int
     public let privacyHitCount: Int
-    public let manualBoxCount: Int
+    public let mosaicCount: Int
     public let assignedNames: [String]
 }

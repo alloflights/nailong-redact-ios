@@ -21,23 +21,8 @@ public struct FlattenedPNGTransfer: Transferable {
 
 @MainActor
 public final class RedactStudioViewModel: ObservableObject {
-    public enum MockSourceMode: String, CaseIterable, Identifiable {
-        case wechat = "微信群聊"
-        case qq = "QQ群聊"
-        case custom = "我的截图"
-        public var id: String { rawValue }
-    }
-
-    public enum DrawerPanel: String, Equatable {
-        case none
-        case colors
-        case nailongSettings
-    }
-
-    @Published public var sourceMode: MockSourceMode = .wechat
-    @Published public var toolMode: EditorToolMode = .magicHighlighter
-    @Published public var activeBarColor: RedactionColorStyle = .inkBlack
-    @Published public var activeDrawer: DrawerPanel = .none
+    @Published public var toolMode: EditorToolMode = .swipeMosaic
+    @Published public var showSettingsDrawer: Bool = false
 
     @Published public var options = RedactionOptions()
     @Published public var baseAvatarCG: CGImage?
@@ -45,13 +30,14 @@ public final class RedactStudioViewModel: ObservableObject {
 
     @Published public var sourceCG: CGImage?
     @Published public var ocrItems: [OCRItem] = []
-    @Published public var manualBoxes: [ManualRedactionBox] = []
+    @Published public var manualMosaics: [ManualMosaicBox] = []
+    @Published private var undoHistory: [[ManualMosaicBox]] = []
+    @Published private var redoHistory: [[ManualMosaicBox]] = []
+
     @Published public var redactedCG: CGImage?
     @Published public var summary: RedactionSummary?
 
     @Published public var isPeekingOriginal = false
-    @Published public var toastMessage: String?
-
     @Published public var selectedPhotoItem: PhotosPickerItem?
 
     @Published public var dragPoints: [CGPoint] = []
@@ -59,15 +45,17 @@ public final class RedactStudioViewModel: ObservableObject {
     @Published public var freeDragCurrent: CGPoint?
 
     private var avatarVariants: [CGImage] = []
-    private var importedCustomCG: CGImage?
 
     public init() {
         loadBaseAvatar()
         if !avatarVariants.isEmpty {
             participants = AliasGenerator.makeParticipants(avatarVariants: avatarVariants)
         }
-        loadSample(for: .wechat)
+        // 启动时不放任何预览图，等待用户导入真实截图
     }
+
+    public var canUndo: Bool { !undoHistory.isEmpty }
+    public var canRedo: Bool { !redoHistory.isEmpty }
 
     public func loadBaseAvatar() {
         var candidates: [URL] = []
@@ -86,47 +74,18 @@ public final class RedactStudioViewModel: ObservableObject {
         }
     }
 
-    public func switchSource(_ mode: MockSourceMode) {
-        sourceMode = mode
-        manualBoxes.removeAll()
-        switch mode {
-        case .wechat:
-            options.platform = .wechat
-            loadSample(for: .wechat)
-        case .qq:
-            options.platform = .qq
-            loadSample(for: .qq)
-        case .custom:
-            options.platform = .auto
-            if let importedCustomCG {
-                setSourceImage(importedCustomCG)
-            }
-        }
-    }
-
-    public func loadSample(for platform: ChatPlatform) {
-        if let cg = SampleChatGenerator.generate(platform: platform, participantCount: options.maxParticipants) {
-            setSourceImage(cg)
-        }
-    }
-
     public func setSourceImage(_ cg: CGImage) {
         sourceCG = cg
+        manualMosaics = []
+        undoHistory = []
+        redoHistory = []
         ocrItems = ChatRedactionEngine.performOCR(on: cg)
         reprocess()
     }
 
     public func importImage(from url: URL) {
-        guard let cg = Self.loadCGImage(at: url) else {
-            showToast("无法读取图片")
-            return
-        }
-        importedCustomCG = cg
-        sourceMode = .custom
-        options.platform = .auto
-        manualBoxes.removeAll()
+        guard let cg = Self.loadCGImage(at: url) else { return }
         setSourceImage(cg)
-        showToast("已载入截图，支持魔法划选")
     }
 
     public func handlePhotoPickerChange() {
@@ -135,21 +94,32 @@ public final class RedactStudioViewModel: ObservableObject {
             if let data = try? await item.loadTransferable(type: Data.self),
                let src = CGImageSourceCreateWithData(data as CFData, nil),
                let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-                importedCustomCG = cg
-                sourceMode = .custom
-                options.platform = .auto
-                manualBoxes.removeAll()
                 setSourceImage(cg)
-                showToast("已导入相册截图")
             }
         }
     }
 
     public func regenerateNailongAliases() {
         guard !avatarVariants.isEmpty else { return }
-        participants = AliasGenerator.makeParticipants(avatarVariants: avatarVariants)
+        let regenerated = AliasGenerator.makeParticipants(avatarVariants: avatarVariants)
+        // 按当前人物优先级顺序刷新各奶龙对应的新随机情绪与编号
+        let byColorID = Dictionary(uniqueKeysWithValues: regenerated.map { ($0.color.id, $0) })
+        participants = participants.compactMap { existing in
+            byColorID[existing.color.id]
+        }
         reprocess()
-        showToast("已随机刷新奶龙情绪与编号")
+    }
+
+    public func moveParticipantUp(at index: Int) {
+        guard index > 0 && index < participants.count else { return }
+        participants.swapAt(index, index - 1)
+        reprocess()
+    }
+
+    public func moveParticipantDown(at index: Int) {
+        guard index >= 0 && index + 1 < participants.count else { return }
+        participants.swapAt(index, index + 1)
+        reprocess()
     }
 
     public func reprocess() {
@@ -158,7 +128,7 @@ public final class RedactStudioViewModel: ObservableObject {
             source: sourceCG,
             participants: participants,
             options: options,
-            manualBoxes: manualBoxes,
+            manualMosaics: manualMosaics,
             precomputedOCR: ocrItems
         ) {
             redactedCG = result.image
@@ -166,90 +136,153 @@ public final class RedactStudioViewModel: ObservableObject {
         }
     }
 
-    /// Black Highlighter 核心交互：划选路径吸合到命中的 OCR 文本行上
-    public func commitMagicStroke(normalizedRectsAlongPath strokeNormRects: [CGRect]) {
-        guard let sourceCG else { return }
+    private func pushMosaicSnapshot(_ newBoxes: [ManualMosaicBox]) {
+        undoHistory.append(manualMosaics)
+        redoHistory.removeAll()
+        manualMosaics = newBoxes
+        reprocess()
+    }
+
+    /// 指哪里打哪里：命中文字时按逐字包围盒局部对齐吸合，非文字区域按划选轨迹打马赛克，绝不整行误伤、绝不弹窗
+    public func commitSwipeMosaic(normalizedPathPoints: [CGPoint]) {
+        guard let sourceCG, !normalizedPathPoints.isEmpty else { return }
         let w = CGFloat(sourceCG.width)
         let h = CGFloat(sourceCG.height)
 
-        var added = 0
-        for item in ocrItems {
-            let normItem = CGRect(
-                x: item.rectTopLeft.minX / w,
-                y: item.rectTopLeft.minY / h,
-                width: item.rectTopLeft.width / w,
-                height: item.rectTopLeft.height / h
-            ).insetBy(dx: -0.004, dy: -0.003)
+        let hitRadiusX: CGFloat = 0.015
+        let hitRadiusY: CGFloat = 0.012
+        var addedBoxes: [ManualMosaicBox] = []
 
-            let hit = strokeNormRects.contains { $0.intersects(normItem) }
-            if hit {
-                let alreadyExists = manualBoxes.contains { box in
-                    abs(box.normalizedRect.midX - normItem.midX) < 0.02 &&
-                    abs(box.normalizedRect.midY - normItem.midY) < 0.015
+        for item in ocrItems {
+            guard !item.charBoxes.isEmpty else { continue }
+            var hitIndices: [Int] = []
+            for (ci, charBox) in item.charBoxes.enumerated() {
+                let normChar = CGRect(
+                    x: charBox.rectTopLeft.minX / w,
+                    y: charBox.rectTopLeft.minY / h,
+                    width: charBox.rectTopLeft.width / w,
+                    height: charBox.rectTopLeft.height / h
+                ).insetBy(dx: -hitRadiusX, dy: -hitRadiusY)
+
+                if normalizedPathPoints.contains(where: { normChar.contains($0) }) {
+                    hitIndices.append(ci)
                 }
-                if !alreadyExists {
-                    manualBoxes.append(ManualRedactionBox(
-                        normalizedRect: normItem,
-                        color: activeBarColor,
-                        matchedOCRText: item.text
-                    ))
-                    added += 1
+            }
+
+            guard !hitIndices.isEmpty else { continue }
+
+            // 合并相邻或仅隔 1 个字符的连续命中片段，保留局部精准度同时不出现细碎裂缝
+            var segments: [(Int, Int)] = []
+            for idx in hitIndices {
+                if let last = segments.last, idx - last.1 <= 2 {
+                    segments[segments.count - 1].1 = idx
+                } else {
+                    segments.append((idx, idx))
+                }
+            }
+
+            for (s, e) in segments {
+                var unionRect = item.charBoxes[s].rectTopLeft
+                for k in (s + 1)...e {
+                    unionRect = unionRect.union(item.charBoxes[k].rectTopLeft)
+                }
+                let normRect = CGRect(
+                    x: max(0, (unionRect.minX - 2) / w),
+                    y: max(0, (unionRect.minY - 2) / h),
+                    width: min(1, (unionRect.width + 4) / w),
+                    height: min(1, (unionRect.height + 4) / h)
+                )
+                addedBoxes.append(ManualMosaicBox(normalizedRect: normRect))
+            }
+        }
+
+        // 若划过区域未命中任何文字（如表情包/图片/空白处），直接按手指轨迹分段打马赛克
+        if addedBoxes.isEmpty {
+            let brushW: CGFloat = 0.055
+            let brushH: CGFloat = 0.032
+            for pt in normalizedPathPoints {
+                let stamp = CGRect(
+                    x: max(0, pt.x - brushW / 2),
+                    y: max(0, pt.y - brushH / 2),
+                    width: min(brushW, 1 - max(0, pt.x - brushW / 2)),
+                    height: min(brushH, 1 - max(0, pt.y - brushH / 2))
+                )
+                if let last = addedBoxes.last, last.normalizedRect.intersects(stamp) {
+                    let merged = last.normalizedRect.union(stamp)
+                    addedBoxes[addedBoxes.count - 1] = ManualMosaicBox(normalizedRect: merged)
+                } else {
+                    addedBoxes.append(ManualMosaicBox(normalizedRect: stamp))
                 }
             }
         }
 
-        if added > 0 {
-            reprocess()
-            showToast("魔法吸合打码 \(added) 处文本")
+        if !addedBoxes.isEmpty {
+            pushMosaicSnapshot(manualMosaics + addedBoxes)
         }
     }
 
-    /// 单击 OCR 文本行快速切换打码/取消
-    public func toggleOCRBox(atNormalizedPoint pt: CGPoint) {
+    /// 点哪里打哪里（或点击已有马赛克撤销）
+    public func handleCanvasTap(atNormalizedPoint pt: CGPoint) {
         guard let sourceCG else { return }
         let w = CGFloat(sourceCG.width)
         let h = CGFloat(sourceCG.height)
 
-        // 先检查是否点在已有手动框上（取消）
-        if let idx = manualBoxes.lastIndex(where: { $0.normalizedRect.insetBy(dx: -0.01, dy: -0.01).contains(pt) }) {
-            manualBoxes.remove(at: idx)
-            reprocess()
+        if let idx = manualMosaics.lastIndex(where: { $0.normalizedRect.insetBy(dx: -0.008, dy: -0.008).contains(pt) }) {
+            var next = manualMosaics
+            next.remove(at: idx)
+            pushMosaicSnapshot(next)
             return
         }
 
-        for item in ocrItems {
-            let normItem = CGRect(
-                x: item.rectTopLeft.minX / w,
-                y: item.rectTopLeft.minY / h,
-                width: item.rectTopLeft.width / w,
-                height: item.rectTopLeft.height / h
-            ).insetBy(dx: -0.005, dy: -0.004)
-            if normItem.contains(pt) {
-                manualBoxes.append(ManualRedactionBox(
-                    normalizedRect: normItem,
-                    color: activeBarColor,
-                    matchedOCRText: item.text
-                ))
-                reprocess()
-                return
+        // 命中某个字符时，局部打码该词组（前后最多延伸 2 个相邻字），不打整行
+        for item in ocrItems where !item.charBoxes.isEmpty {
+            for (ci, charBox) in item.charBoxes.enumerated() {
+                let normChar = CGRect(
+                    x: charBox.rectTopLeft.minX / w,
+                    y: charBox.rectTopLeft.minY / h,
+                    width: charBox.rectTopLeft.width / w,
+                    height: charBox.rectTopLeft.height / h
+                ).insetBy(dx: -0.008, dy: -0.008)
+                if normChar.contains(pt) {
+                    let lo = max(0, ci - 1)
+                    let hi = min(item.charBoxes.count - 1, ci + 1)
+                    var unionRect = item.charBoxes[lo].rectTopLeft
+                    for k in lo...hi {
+                        unionRect = unionRect.union(item.charBoxes[k].rectTopLeft)
+                    }
+                    let normRect = CGRect(
+                        x: max(0, (unionRect.minX - 2) / w),
+                        y: max(0, (unionRect.minY - 2) / h),
+                        width: min(1, (unionRect.width + 4) / w),
+                        height: min(1, (unionRect.height + 4) / h)
+                    )
+                    pushMosaicSnapshot(manualMosaics + [ManualMosaicBox(normalizedRect: normRect)])
+                    return
+                }
             }
         }
+
+        // 非文字区域：在点击处生成一小块马赛克
+        let stamp = CGRect(x: max(0, pt.x - 0.03), y: max(0, pt.y - 0.018), width: 0.06, height: 0.036)
+        pushMosaicSnapshot(manualMosaics + [ManualMosaicBox(normalizedRect: stamp)])
     }
 
-    public func commitFreeBox(normalizedRect: CGRect) {
-        guard normalizedRect.width > 0.015 && normalizedRect.height > 0.01 else { return }
-        manualBoxes.append(ManualRedactionBox(normalizedRect: normalizedRect, color: activeBarColor))
+    public func commitFreeBoxMosaic(normalizedRect: CGRect) {
+        guard normalizedRect.width > 0.012 && normalizedRect.height > 0.008 else { return }
+        pushMosaicSnapshot(manualMosaics + [ManualMosaicBox(normalizedRect: normalizedRect)])
+    }
+
+    public func undo() {
+        guard let prev = undoHistory.popLast() else { return }
+        redoHistory.append(manualMosaics)
+        manualMosaics = prev
         reprocess()
     }
 
-    public func undoLastBox() {
-        guard !manualBoxes.isEmpty else { return }
-        manualBoxes.removeLast()
-        reprocess()
-    }
-
-    public func clearManualBoxes() {
-        manualBoxes.removeAll()
+    public func redo() {
+        guard let next = redoHistory.popLast() else { return }
+        undoHistory.append(manualMosaics)
+        manualMosaics = next
         reprocess()
     }
 
@@ -275,20 +308,9 @@ public final class RedactStudioViewModel: ObservableObject {
         panel.nameFieldStringValue = "奶龙隐私打码_无EXIF.png"
         if panel.runModal() == .OK, let url = panel.url {
             try? data.write(to: url)
-            showToast("已导出无 EXIF 扁平图")
         }
     }
     #endif
-
-    private func showToast(_ msg: String) {
-        toastMessage = msg
-        Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            if toastMessage == msg {
-                toastMessage = nil
-            }
-        }
-    }
 
     private static func loadCGImage(at url: URL) -> CGImage? {
         guard let provider = CGDataProvider(url: url as CFURL),
@@ -300,7 +322,7 @@ public final class RedactStudioViewModel: ObservableObject {
     }
 }
 
-/// iPhone 主界面（Black Highlighter 交互模型 + iOS 26 Liquid Glass 液态玻璃浮动控台）
+/// iPhone 主界面（统一蓝色强调色 + iOS 26 液态玻璃浮动控台 + 指哪打哪马赛克）
 public struct iPhoneAppView: View {
     @ObservedObject var vm: RedactStudioViewModel
     @Namespace private var glassNS
@@ -311,40 +333,25 @@ public struct iPhoneAppView: View {
 
     public var body: some View {
         ZStack {
-            // Black Highlighter 标志性深色沉浸画布
             Color(red: 0.06, green: 0.065, blue: 0.085)
                 .ignoresSafeArea()
 
-            // 核心截图画布 + 魔法划选 / 框选交互层
             canvasStage
                 .padding(.top, 58)
                 .padding(.bottom, 92)
 
-            // 顶部浮动 Liquid Glass 导航胶囊
             VStack {
                 topGlassBar
                     .padding(.horizontal, 14)
                     .padding(.top, 8)
-
-                if let toast = vm.toastMessage {
-                    Text(toast)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .adaptiveGlass(tint: .indigo, interactive: false, shape: .capsule)
-                        .transition(.opacity.combined(with: .scale(scale: 0.92)))
-                }
-
                 Spacer()
             }
 
-            // 底部浮动 Liquid Glass 抽屉 + 控台工具坞
             VStack(spacing: 10) {
                 Spacer()
 
-                if vm.activeDrawer != .none {
-                    expandedGlassDrawer
+                if vm.showSettingsDrawer {
+                    expandedSettingsDrawer
                         .padding(.horizontal, 14)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
@@ -354,15 +361,15 @@ public struct iPhoneAppView: View {
                     .padding(.bottom, 10)
             }
         }
-        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: vm.activeDrawer)
-        .animation(.easeInOut(duration: 0.2), value: vm.toastMessage)
+        .tint(.blue)
+        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: vm.showSettingsDrawer)
         .preferredColorScheme(.dark)
         .onChange(of: vm.selectedPhotoItem) {
             vm.handlePhotoPickerChange()
         }
     }
 
-    // MARK: - 画布与 Black Highlighter 手势层
+    // MARK: - 画布与指哪打哪马赛克交互层
 
     private var canvasStage: some View {
         GeometryReader { geo in
@@ -380,34 +387,20 @@ public struct iPhoneAppView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                             .shadow(color: .black.opacity(0.45), radius: 18, y: 8)
 
-                        // 魔法划选模式下展示极淡的文本块提示底线，暗示可一划即吸合
-                        if vm.toolMode == .magicHighlighter && !vm.isPeekingOriginal {
-                            ocrHintOverlay(imageCG: displayCG, fitSize: fitSize)
-                        }
-
-                        // 实时荧光笔划动轨迹 / 自由框选矩形预览
                         liveGestureOverlay(fitSize: fitSize)
                     }
                     .frame(width: fitSize.width, height: fitSize.height)
                     .contentShape(Rectangle())
                     .gesture(canvasGesture(fitSize: fitSize))
                     .onTapGesture { location in
-                        guard vm.toolMode == .magicHighlighter else { return }
                         let normPt = CGPoint(
                             x: min(1, max(0, location.x / fitSize.width)),
                             y: min(1, max(0, location.y / fitSize.height))
                         )
-                        vm.toggleOCRBox(atNormalizedPoint: normPt)
+                        vm.handleCanvasTap(atNormalizedPoint: normPt)
                     }
                 } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "photo.badge.plus")
-                            .font(.system(size: 38))
-                            .foregroundStyle(.white.opacity(0.6))
-                        Text("导入微信 / QQ 聊天截图开始打码")
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
+                    emptyImportView
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
@@ -415,33 +408,44 @@ public struct iPhoneAppView: View {
         .padding(.horizontal, 12)
     }
 
-    private func ocrHintOverlay(imageCG: CGImage, fitSize: CGSize) -> some View {
-        let imgW = CGFloat(imageCG.width)
-        let imgH = CGFloat(imageCG.height)
-        return ZStack(alignment: .topLeading) {
-            ForEach(vm.ocrItems) { item in
-                let rx = item.rectTopLeft.minX / imgW * fitSize.width
-                let ry = item.rectTopLeft.minY / imgH * fitSize.height
-                let rw = item.rectTopLeft.width / imgW * fitSize.width
-                let rh = item.rectTopLeft.height / imgH * fitSize.height
-                Rectangle()
-                    .fill(Color.clear)
-                    .overlay(alignment: .bottom) {
-                        Rectangle()
-                            .fill(Color.white.opacity(0.14))
-                            .frame(height: 1)
-                    }
-                    .frame(width: rw, height: rh)
-                    .offset(x: rx, y: ry)
+    private var emptyImportView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "photo.badge.plus")
+                .font(.system(size: 44))
+                .foregroundStyle(.white.opacity(0.75))
+
+            Text("导入微信或 QQ 聊天截图")
+                .font(.headline)
+                .foregroundStyle(.white.opacity(0.88))
+
+            #if os(iOS)
+            PhotosPicker(selection: $vm.selectedPhotoItem, matching: .images) {
+                Label("从相册选择截图", systemImage: "photo.on.rectangle")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 11)
             }
+            .adaptiveGlass(tint: .blue, interactive: true, shape: .capsule)
+            #else
+            Button {
+                vm.openFilePanel()
+            } label: {
+                Label("导入截图", systemImage: "photo.on.rectangle")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 11)
+            }
+            .buttonStyle(.plain)
+            .adaptiveGlass(tint: .blue, interactive: true, shape: .capsule)
+            #endif
         }
-        .frame(width: fitSize.width, height: fitSize.height, alignment: .topLeading)
-        .allowsHitTesting(false)
     }
 
     private func liveGestureOverlay(fitSize: CGSize) -> some View {
         ZStack {
-            if vm.toolMode == .magicHighlighter && vm.dragPoints.count > 1 {
+            if vm.toolMode == .swipeMosaic && vm.dragPoints.count > 1 {
                 Path { path in
                     path.move(to: vm.dragPoints[0])
                     for pt in vm.dragPoints.dropFirst() {
@@ -449,12 +453,12 @@ public struct iPhoneAppView: View {
                     }
                 }
                 .stroke(
-                    vm.activeBarColor.swiftUIColor.opacity(0.65),
-                    style: StrokeStyle(lineWidth: 22, lineCap: .round, lineJoin: .round)
+                    Color.blue.opacity(0.55),
+                    style: StrokeStyle(lineWidth: 20, lineCap: .round, lineJoin: .round)
                 )
             }
 
-            if vm.toolMode == .freeBox, let origin = vm.freeDragOrigin, let current = vm.freeDragCurrent {
+            if vm.toolMode == .freeBoxMosaic, let origin = vm.freeDragOrigin, let current = vm.freeDragCurrent {
                 let rect = CGRect(
                     x: min(origin.x, current.x),
                     y: min(origin.y, current.y),
@@ -462,8 +466,8 @@ public struct iPhoneAppView: View {
                     height: abs(current.y - origin.y)
                 )
                 RoundedRectangle(cornerRadius: 4)
-                    .fill(vm.activeBarColor.swiftUIColor.opacity(0.55))
-                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.white.opacity(0.8), lineWidth: 1))
+                    .fill(Color.blue.opacity(0.35))
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.white.opacity(0.85), lineWidth: 1))
                     .frame(width: rect.width, height: rect.height)
                     .position(x: rect.midX, y: rect.midY)
             }
@@ -479,7 +483,7 @@ public struct iPhoneAppView: View {
                     x: min(fitSize.width, max(0, value.location.x)),
                     y: min(fitSize.height, max(0, value.location.y))
                 )
-                if vm.toolMode == .magicHighlighter {
+                if vm.toolMode == .swipeMosaic {
                     if vm.dragPoints.isEmpty {
                         let start = CGPoint(
                             x: min(fitSize.width, max(0, value.startLocation.x)),
@@ -499,16 +503,11 @@ public struct iPhoneAppView: View {
                 }
             }
             .onEnded { _ in
-                if vm.toolMode == .magicHighlighter {
-                    let hitNormRects = vm.dragPoints.map { pt in
-                        CGRect(
-                            x: (pt.x - 10) / fitSize.width,
-                            y: (pt.y - 10) / fitSize.height,
-                            width: 20 / fitSize.width,
-                            height: 20 / fitSize.height
-                        )
+                if vm.toolMode == .swipeMosaic {
+                    let normPoints = vm.dragPoints.map { pt in
+                        CGPoint(x: pt.x / fitSize.width, y: pt.y / fitSize.height)
                     }
-                    vm.commitMagicStroke(normalizedRectsAlongPath: hitNormRects)
+                    vm.commitSwipeMosaic(normalizedPathPoints: normPoints)
                     vm.dragPoints.removeAll()
                 } else if let origin = vm.freeDragOrigin, let current = vm.freeDragCurrent {
                     let normRect = CGRect(
@@ -517,22 +516,23 @@ public struct iPhoneAppView: View {
                         width: abs(current.x - origin.x) / fitSize.width,
                         height: abs(current.y - origin.y) / fitSize.height
                     )
-                    vm.commitFreeBox(normalizedRect: normRect)
+                    vm.commitFreeBoxMosaic(normalizedRect: normRect)
                     vm.freeDragOrigin = nil
                     vm.freeDragCurrent = nil
                 }
             }
     }
 
-    // MARK: - 顶部 Liquid Glass 悬浮栏
+    // MARK: - 顶部 Liquid Glass 导航栏
 
     private var topGlassBar: some View {
         AdaptiveGlassContainer(spacing: 10) {
             HStack(spacing: 8) {
                 #if os(iOS)
-                PhotosPicker(selection: $vm.selectedPhotoItem, matching: .screenshots) {
+                PhotosPicker(selection: $vm.selectedPhotoItem, matching: .images) {
                     Label("相册", systemImage: "photo.on.rectangle")
                         .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                 }
@@ -543,6 +543,7 @@ public struct iPhoneAppView: View {
                 } label: {
                     Label("导入", systemImage: "photo.on.rectangle")
                         .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                 }
@@ -552,36 +553,48 @@ public struct iPhoneAppView: View {
 
                 Spacer()
 
-                // 按住预览原图按钮（Black Highlighter 经典长按对比交互）
-                HStack(spacing: 4) {
-                    Image(systemName: vm.isPeekingOriginal ? "eye.fill" : "eye")
-                        .font(.caption.weight(.semibold))
-                    Text(vm.isPeekingOriginal ? "原图" : "对比")
-                        .font(.caption2.weight(.semibold))
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .adaptiveGlass(tint: vm.isPeekingOriginal ? .orange : nil, interactive: true, shape: .capsule)
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { _ in vm.isPeekingOriginal = true }
-                        .onEnded { _ in vm.isPeekingOriginal = false }
-                )
+                // 对比按钮：仅保留眼睛图标，无文字
+                Image(systemName: vm.isPeekingOriginal ? "eye.fill" : "eye")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 36, height: 34)
+                    .adaptiveGlass(tint: vm.isPeekingOriginal ? .blue : nil, interactive: true, shape: .circle)
+                    .opacity(vm.sourceCG == nil ? 0.45 : 1.0)
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in if vm.sourceCG != nil { vm.isPeekingOriginal = true } }
+                            .onEnded { _ in vm.isPeekingOriginal = false }
+                    )
 
-                // 撤销手动涂抹
+                // 回退（撤销）按钮
                 Button {
-                    vm.undoLastBox()
+                    vm.undo()
                 } label: {
                     Image(systemName: "arrow.uturn.backward")
                         .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
                         .frame(width: 34, height: 34)
                 }
                 .buttonStyle(.plain)
-                .disabled(vm.manualBoxes.isEmpty)
-                .opacity(vm.manualBoxes.isEmpty ? 0.45 : 1.0)
+                .disabled(!vm.canUndo)
+                .opacity(vm.canUndo ? 1.0 : 0.4)
                 .adaptiveGlass(interactive: true, shape: .circle)
 
-                // 分享 / 导出无 EXIF 图
+                // 前进（重做）按钮，紧挨回退按钮右侧
+                Button {
+                    vm.redo()
+                } label: {
+                    Image(systemName: "arrow.uturn.forward")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+                .disabled(!vm.canRedo)
+                .opacity(vm.canRedo ? 1.0 : 0.4)
+                .adaptiveGlass(interactive: true, shape: .circle)
+
+                // 导出按钮（白色图标 + 蓝色玻璃）
                 #if os(iOS)
                 if let pngData = vm.exportFlattenedData(), let img = vm.redactedCG {
                     ShareLink(
@@ -590,9 +603,16 @@ public struct iPhoneAppView: View {
                     ) {
                         Image(systemName: "square.and.arrow.up")
                             .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
                             .frame(width: 36, height: 34)
                     }
                     .adaptiveGlass(tint: .blue, interactive: true, shape: .circle)
+                } else {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .frame(width: 36, height: 34)
+                        .adaptiveGlass(tint: .blue.opacity(0.45), interactive: false, shape: .circle)
                 }
                 #else
                 Button {
@@ -600,227 +620,227 @@ public struct iPhoneAppView: View {
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                         .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
                         .frame(width: 36, height: 34)
                 }
                 .buttonStyle(.plain)
+                .disabled(vm.redactedCG == nil)
+                .opacity(vm.redactedCG == nil ? 0.45 : 1.0)
                 .adaptiveGlass(tint: .blue, interactive: true, shape: .circle)
                 #endif
             }
         }
     }
 
-    // MARK: - 底部 Liquid Glass 悬浮坞 & 可形变抽屉
+    // MARK: - 底部 Liquid Glass 控台与抽屉
 
     private var bottomGlassDock: some View {
         AdaptiveGlassContainer(spacing: 10) {
-            HStack(spacing: 8) {
-                // 一键奶龙自动打码开关
+            HStack(spacing: 10) {
+                // 左下角按钮：改名为“奶龙化”
                 Button {
                     vm.options.autoNailongChat.toggle()
                     vm.reprocess()
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: "sparkles")
                             .font(.caption.weight(.bold))
-                        Text("奶龙")
+                        Text("奶龙化")
                             .font(.caption.weight(.semibold))
                     }
-                    .padding(.horizontal, 12)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
                 .adaptiveGlass(
-                    tint: vm.options.autoNailongChat ? Color(red: 86/255, green: 89/255, blue: 201/255) : nil,
+                    tint: vm.options.autoNailongChat ? .blue : nil,
                     interactive: true,
                     shape: .capsule
                 )
                 .adaptiveGlassID("nailongToggle", in: glassNS)
 
-                // Black Highlighter 魔法划选
+                // 划选马赛克（指哪打哪）
                 Button {
-                    vm.toolMode = .magicHighlighter
+                    vm.toolMode = .swipeMosaic
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "highlighter")
+                    HStack(spacing: 5) {
+                        Image(systemName: "scribble.variable")
                             .font(.caption.weight(.semibold))
                         Text("划选")
                             .font(.caption.weight(.semibold))
                     }
-                    .padding(.horizontal, 11)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 13)
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
                 .adaptiveGlass(
-                    tint: vm.toolMode == .magicHighlighter ? .teal : nil,
+                    tint: vm.toolMode == .swipeMosaic ? .blue : nil,
                     interactive: true,
                     shape: .capsule
                 )
-                .adaptiveGlassID("magicTool", in: glassNS)
+                .adaptiveGlassID("swipeTool", in: glassNS)
 
-                // 自由框选
+                // 框选马赛克
                 Button {
-                    vm.toolMode = .freeBox
+                    vm.toolMode = .freeBoxMosaic
                 } label: {
-                    Image(systemName: "rectangle.dashed")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 38, height: 38)
+                    HStack(spacing: 5) {
+                        Image(systemName: "rectangle.dashed")
+                            .font(.caption.weight(.semibold))
+                        Text("框选")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
                 .adaptiveGlass(
-                    tint: vm.toolMode == .freeBox ? .teal : nil,
+                    tint: vm.toolMode == .freeBoxMosaic ? .blue : nil,
                     interactive: true,
-                    shape: .circle
+                    shape: .capsule
                 )
                 .adaptiveGlassID("boxTool", in: glassNS)
 
-                // 颜色抽屉按钮（显示当前实心涂抹颜色点）
+                // 多人与隐私设置抽屉开关
                 Button {
-                    vm.activeDrawer = (vm.activeDrawer == .colors) ? .none : .colors
-                } label: {
-                    Circle()
-                        .fill(vm.activeBarColor.swiftUIColor)
-                        .frame(width: 18, height: 18)
-                        .overlay(Circle().stroke(.white.opacity(0.8), lineWidth: 1.5))
-                        .frame(width: 38, height: 38)
-                }
-                .buttonStyle(.plain)
-                .adaptiveGlass(tint: vm.activeDrawer == .colors ? .white.opacity(0.25) : nil, interactive: true, shape: .circle)
-                .adaptiveGlassID("colorDrawer", in: glassNS)
-
-                // 10人奶龙 & 隐私面板开关
-                Button {
-                    vm.activeDrawer = (vm.activeDrawer == .nailongSettings) ? .none : .nailongSettings
+                    vm.showSettingsDrawer.toggle()
                 } label: {
                     Image(systemName: "person.3.sequence.fill")
                         .font(.caption.weight(.semibold))
-                        .frame(width: 38, height: 38)
+                        .foregroundStyle(.white)
+                        .frame(width: 40, height: 38)
                 }
                 .buttonStyle(.plain)
-                .adaptiveGlass(tint: vm.activeDrawer == .nailongSettings ? .indigo : nil, interactive: true, shape: .circle)
+                .adaptiveGlass(tint: vm.showSettingsDrawer ? .blue : nil, interactive: true, shape: .circle)
                 .adaptiveGlassID("settingsDrawer", in: glassNS)
             }
         }
     }
 
-    @ViewBuilder
-    private var expandedGlassDrawer: some View {
-        switch vm.activeDrawer {
-        case .none:
-            EmptyView()
-        case .colors:
-            AdaptiveGlassContainer(spacing: 10) {
-                HStack(spacing: 12) {
-                    ForEach(RedactionColorStyle.allCases) { style in
-                        Button {
-                            vm.activeBarColor = style
-                            vm.options.privacyBarColor = style
-                            vm.reprocess()
-                        } label: {
-                            VStack(spacing: 3) {
-                                Circle()
-                                    .fill(style.swiftUIColor)
-                                    .frame(width: 24, height: 24)
-                                    .overlay(
-                                        Circle().stroke(
-                                            vm.activeBarColor == style ? Color.white : Color.white.opacity(0.25),
-                                            lineWidth: vm.activeBarColor == style ? 2.5 : 1
-                                        )
-                                    )
-                                Text(style.rawValue)
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundStyle(.white.opacity(0.9))
-                            }
-                            .padding(.vertical, 4)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .adaptiveGlass(interactive: true, shape: .roundedRect(22))
-                .adaptiveGlassID("colorDrawer", in: glassNS)
-            }
+    // MARK: - 多人优先级与隐藏信息分段菜单
 
-        case .nailongSettings:
-            VStack(alignment: .leading, spacing: 10) {
+    private var expandedSettingsDrawer: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                // 第一段：人物优先级（支持调序与自定义改名，无人数上限滑块）
                 HStack {
-                    Text("10 人奶龙头像与脱敏")
-                        .font(.caption.bold())
+                    Text("人物优先级")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
                     Spacer()
-                    Button("重抽情绪") {
+                    Button {
                         vm.regenerateNailongAliases()
+                    } label: {
+                        Text("随机重抽")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
                     }
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .buttonStyle(.plain)
                     .adaptiveGlass(tint: .blue, interactive: true, shape: .capsule)
                 }
 
-                // 10 色奶龙头像横向预览条
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(vm.participants.prefix(vm.options.maxParticipants)) { p in
-                            HStack(spacing: 5) {
-                                Image(platformImage: PlatformImage.from(cgImage: p.avatarCGImage))
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: 26, height: 26)
-                                    .clipShape(RoundedRectangle(cornerRadius: vm.summary?.detectedPlatform == .qq ? 13 : 5))
-                                Text(p.displayName)
-                                    .font(.system(size: 10, weight: .medium))
-                                    .lineLimit(1)
+                VStack(spacing: 8) {
+                    ForEach(Array(vm.participants.enumerated()), id: \.element.id) { index, p in
+                        HStack(spacing: 8) {
+                            Text("\(index + 1)")
+                                .font(.caption.bold())
+                                .foregroundStyle(.white.opacity(0.75))
+                                .frame(width: 18)
+
+                            Image(platformImage: PlatformImage.from(cgImage: p.avatarCGImage))
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: 28, height: 28)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                            TextField(
+                                "奶龙昵称",
+                                text: Binding(
+                                    get: { vm.participants[index].displayName },
+                                    set: { newVal in
+                                        vm.participants[index].displayName = newVal
+                                        vm.reprocess()
+                                    }
+                                )
+                            )
+                            .textFieldStyle(.plain)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+
+                            Button {
+                                vm.moveParticipantUp(at: index)
+                            } label: {
+                                Image(systemName: "chevron.up")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.white)
+                                    .frame(width: 24, height: 24)
                             }
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 4)
-                            .background(p.color.swiftUIColor.opacity(0.28))
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .buttonStyle(.plain)
+                            .disabled(index == 0)
+                            .opacity(index == 0 ? 0.3 : 1.0)
+
+                            Button {
+                                vm.moveParticipantDown(at: index)
+                            } label: {
+                                Image(systemName: "chevron.down")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.white)
+                                    .frame(width: 24, height: 24)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(index == vm.participants.count - 1)
+                            .opacity(index == vm.participants.count - 1 ? 0.3 : 1.0)
                         }
                     }
                 }
 
-                HStack(spacing: 10) {
-                    Text("人数 \(vm.options.maxParticipants)")
-                        .font(.caption2)
-                        .monospacedDigit()
-                    Slider(
-                        value: Binding(
-                            get: { Double(vm.options.maxParticipants) },
-                            set: {
-                                vm.options.maxParticipants = Int($0.rounded())
-                                if vm.sourceMode != .custom {
-                                    vm.loadSample(for: vm.sourceMode == .qq ? .qq : .wechat)
-                                } else {
-                                    vm.reprocess()
-                                }
-                            }
-                        ),
-                        in: 1...10,
-                        step: 1
-                    )
-                }
+                Divider()
+                    .background(Color.white.opacity(0.18))
 
-                HStack(spacing: 12) {
-                    Toggle("手机", isOn: $vm.options.redactPhones)
+                // 第二段：需要隐藏的信息
+                Text("需要隐藏的信息")
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.white)
+
+                VStack(spacing: 8) {
+                    Toggle("手机号", isOn: $vm.options.redactPhones)
                         .onChange(of: vm.options.redactPhones) { vm.reprocess() }
-                    Toggle("证件", isOn: $vm.options.redactIDsAndCards)
+                    Toggle("身份证 / 银行卡", isOn: $vm.options.redactIDsAndCards)
                         .onChange(of: vm.options.redactIDsAndCards) { vm.reprocess() }
-                    Toggle("@提及", isOn: $vm.options.redactMentions)
+                    Toggle("微信号 / 邮箱", isOn: $vm.options.redactAccountsAndEmails)
+                        .onChange(of: vm.options.redactAccountsAndEmails) { vm.reprocess() }
+                    Toggle("@提及替换", isOn: $vm.options.redactMentions)
                         .onChange(of: vm.options.redactMentions) { vm.reprocess() }
+                    Toggle("顶部群名 / 备注", isOn: $vm.options.maskTopTitle)
+                        .onChange(of: vm.options.maskTopTitle) { vm.reprocess() }
                 }
-                .font(.caption2)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white)
+                .tint(.blue)
 
+                // 识别统计数据（字号调大，直接显示“已识别”）
                 if let s = vm.summary {
-                    Text("已识别 \(s.detectedPlatform.rawValue) · \(s.avatarCount) 头像 · \(s.nameReplacementCount) 名字 · \(s.privacyHitCount) 隐私 · \(s.manualBoxCount) 划选")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.65))
+                    Divider()
+                        .background(Color.white.opacity(0.18))
+                    Text("已识别：\(s.detectedPlatform.rawValue) · 头像 \(s.avatarCount) · 名字 \(s.nameReplacementCount) · 隐私 \(s.privacyHitCount) · 马赛克 \(s.mosaicCount)")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.92))
                 }
             }
             .padding(14)
-            .adaptiveGlass(interactive: true, shape: .roundedRect(24))
-            .adaptiveGlassID("settingsDrawer", in: glassNS)
         }
+        .frame(maxHeight: 360)
+        .adaptiveGlass(interactive: true, shape: .roundedRect(24))
+        .adaptiveGlassID("settingsDrawer", in: glassNS)
     }
 
     private func aspectFitSize(aspect: CGFloat, in container: CGSize) -> CGSize {
