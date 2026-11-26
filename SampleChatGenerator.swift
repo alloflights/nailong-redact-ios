@@ -73,13 +73,16 @@ public enum SampleChatGenerator {
         ctx.setFillColor(CGColor(srgbRed: 0.84, green: 0.84, blue: 0.86, alpha: 1.0))
         ctx.fill(CGRect(x: 0, y: H - navHeight, width: W, height: 1))
 
-        // 状态栏时间
-        drawText(ctx, text: "23:18", atTopLeft: CGPoint(x: 42, y: 24), imageHeight: H, fontSize: 22, weight: .semibold, color: .black)
-
         // 顶部返回箭头 & 群标题
-        drawText(ctx, text: "‹", atTopLeft: CGPoint(x: 24, y: 74), imageHeight: H, fontSize: 36, weight: .regular, color: .black)
+        let cgBlack = CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
+        let cgWhite = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+
+        // 状态栏时间
+        drawText(ctx, text: "23:18", atTopLeft: CGPoint(x: 42, y: 24), imageHeight: H, fontSize: 22, weight: .semibold, color: cgBlack)
+
+        drawText(ctx, text: "‹", atTopLeft: CGPoint(x: 24, y: 74), imageHeight: H, fontSize: 36, weight: .regular, color: cgBlack)
         let titleText = isQQ ? "产品内测交流群(\(count))" : "项目协作群(\(count))"
-        drawCenteredText(ctx, text: titleText, centerX: W / 2, topY: 84, imageHeight: H, fontSize: 27, weight: .semibold, color: .black)
+        drawCenteredText(ctx, text: titleText, centerX: W / 2, topY: 84, imageHeight: H, fontSize: 27, weight: .semibold, color: cgBlack)
 
         // 构建覆盖 1~count 个人的消息流
         let messages = buildMessages(participantCount: count)
@@ -111,7 +114,7 @@ public enum SampleChatGenerator {
                 let selfBubbleColor = isQQ
                     ? CGColor(srgbRed: 0.0, green: 0.60, blue: 1.0, alpha: 1.0)
                     : CGColor(srgbRed: 0.584, green: 0.925, blue: 0.412, alpha: 1.0)
-                let selfTextColor: CGColor = isQQ ? .white : .black
+                let selfTextColor: CGColor = isQQ ? cgWhite : cgBlack
                 fillRoundedRect(ctx, rectTopLeft: bubbleRectTopLeft, imageHeight: H, radius: isQQ ? 20 : 12, color: selfBubbleColor)
                 drawWrappedText(
                     ctx,
@@ -138,7 +141,7 @@ public enum SampleChatGenerator {
                         ? CGColor(srgbRed: 0.96, green: 0.68, blue: 0.20, alpha: 1.0)
                         : CGColor(srgbRed: 0.52, green: 0.66, blue: 0.96, alpha: 1.0)
                     fillRoundedRect(ctx, rectTopLeft: badgeRect, imageHeight: H, radius: 6, color: badgeColor)
-                    drawText(ctx, text: user.qqBadge, atTopLeft: CGPoint(x: badgeRect.minX + 8, y: badgeRect.minY + 3), imageHeight: H, fontSize: 15, weight: .semibold, color: .white)
+                    drawText(ctx, text: user.qqBadge, atTopLeft: CGPoint(x: badgeRect.minX + 8, y: badgeRect.minY + 3), imageHeight: H, fontSize: 15, weight: .semibold, color: cgWhite)
                     nameStartX += badgeW + 8
                 }
 
@@ -155,14 +158,14 @@ public enum SampleChatGenerator {
 
                 // 气泡
                 let bubbleRectTopLeft = CGRect(x: avatarRectTopLeft.maxX + 18, y: currentTopY + 28, width: bubbleW, height: bubbleH)
-                fillRoundedRect(ctx, rectTopLeft: bubbleRectTopLeft, imageHeight: H, radius: isQQ ? 20 : 12, color: .white)
+                fillRoundedRect(ctx, rectTopLeft: bubbleRectTopLeft, imageHeight: H, radius: isQQ ? 20 : 12, color: cgWhite)
                 drawWrappedText(
                     ctx,
                     text: msg.text,
                     rectTopLeft: CGRect(x: bubbleRectTopLeft.minX + textPaddingX, y: bubbleRectTopLeft.minY + textPaddingY, width: maxTextWidth, height: bubbleH - textPaddingY),
                     imageHeight: H,
                     fontSize: fontSize,
-                    color: .black
+                    color: cgBlack
                 )
                 currentTopY += max(avatarSize, bubbleH + 28) + 22
             }
@@ -172,7 +175,7 @@ public enum SampleChatGenerator {
         let footerH: CGFloat = 104
         ctx.setFillColor(CGColor(srgbRed: 0.965, green: 0.965, blue: 0.97, alpha: 1.0))
         ctx.fill(CGRect(x: 0, y: 0, width: W, height: footerH))
-        fillRoundedRect(ctx, rectTopLeft: CGRect(x: 84, y: H - footerH + 20, width: W - 210, height: 56), imageHeight: H, radius: 12, color: .white)
+        fillRoundedRect(ctx, rectTopLeft: CGRect(x: 84, y: H - footerH + 20, width: W - 210, height: 56), imageHeight: H, radius: 12, color: cgWhite)
 
         return ctx.makeImage()
     }
@@ -239,7 +242,7 @@ public enum SampleChatGenerator {
             imageHeight: imageHeight,
             fontSize: 30,
             weight: .bold,
-            color: .white
+            color: CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
         )
     }
 
